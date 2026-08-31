@@ -14,7 +14,7 @@ const {
 	parseTokenBudget,
 	statusLine,
 	truncateObjective,
-} = jiti("../.pi/extensions/pi-goal/goal-state.ts");
+} = jiti("../src/goal-state.ts");
 
 test("parseTokenBudget returns trimmed objective with no budget", () => {
 	assert.deepEqual(parseTokenBudget("  finish the migration  "), {

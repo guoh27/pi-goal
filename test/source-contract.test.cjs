@@ -3,7 +3,7 @@ const { readFileSync } = require("node:fs");
 const { join } = require("node:path");
 const { test } = require("node:test");
 
-const indexSource = readFileSync(join(__dirname, "../.pi/extensions/pi-goal/index.ts"), "utf8");
+const indexSource = readFileSync(join(__dirname, "../src/index.ts"), "utf8");
 const readme = readFileSync(join(__dirname, "../README.md"), "utf8");
 
 test("create_goal tool carries strong goal-writing contract", () => {

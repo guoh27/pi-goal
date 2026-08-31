@@ -3,3 +3,4 @@ node_modules/
 codex/
 *.tgz
 npm-debug.log*
+.pi/

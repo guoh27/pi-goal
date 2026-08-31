@@ -3,7 +3,7 @@ const { test } = require("node:test");
 const { createJiti } = require("jiti");
 
 const jiti = createJiti(__filename);
-const { tokenDeltaFromUsage } = jiti("../.pi/extensions/pi-goal/usage.ts");
+const { tokenDeltaFromUsage } = jiti("../src/usage.ts");
 
 test("tokenDeltaFromUsage counts input, output, and cache tokens", () => {
 	assert.equal(tokenDeltaFromUsage({ input: 100, output: 25, cacheRead: 50, cacheWrite: 75 }), 250);

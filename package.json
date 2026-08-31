@@ -1,41 +1,51 @@
 {
-  "name": "pi-goal",
-  "version": "0.1.7",
-  "description": "Persistent autonomous goals for pi — /goal loops until complete, paused, or budget-limited",
-  "type": "commonjs",
-  "keywords": [
-    "pi-package",
-    "pi",
-    "coding-agent",
-    "goal",
-    "automation"
-  ],
-  "files": [
-    ".pi/",
-    "skills/",
-    "README.md",
-    "LICENSE"
-  ],
-  "pi": {
-    "extensions": [
-      ".pi/extensions/pi-goal"
-    ],
-    "skills": [
-      "skills"
-    ]
-  },
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*"
-  },
-  "devDependencies": {
-    "jiti": "^2.7.0"
-  },
-  "scripts": {
-    "check": "pi --no-extensions -e ./.pi/extensions/pi-goal/index.ts --list-models __pi_goal_load_check__",
-    "test": "node --test test/**/*.test.cjs",
-    "pack:dry": "npm pack --dry-run"
-  },
-  "author": "michaelliv",
-  "license": "MIT"
+	"name": "pi-goal",
+	"version": "0.2.0",
+	"description": "Persistent autonomous goals + built-in provider retry + background-aware continuation for pi — one extension, one autonomous-turn owner",
+	"type": "commonjs",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"coding-agent",
+		"goal",
+		"automation",
+		"retry",
+		"background-tasks"
+	],
+	"files": [
+		"src/",
+		"skills/",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		],
+		"skills": [
+			"skills"
+		]
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-coding-agent": "*",
+		"@mariozechner/pi-tui": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"@mariozechner/pi-coding-agent": "*",
+		"@mariozechner/pi-tui": "*",
+		"@types/node": "^24",
+		"jiti": "^2.7.0",
+		"typescript": "^5"
+	},
+	"scripts": {
+		"check": "pi --no-extensions -e ./src/index.ts --list-models __pi_goal_load_check__",
+		"test": "node --test test/**/*.test.cjs",
+		"typecheck": "tsc --noEmit",
+		"pack:dry": "npm pack --dry-run"
+	},
+	"author": "michaelliv",
+	"license": "MIT"
 }
