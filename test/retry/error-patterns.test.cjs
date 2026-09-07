@@ -70,6 +70,47 @@ test("per-minute rate limits and pay-as-you-go balance errors stay retryable", (
 	assert.equal(patterns.hasCreditError(errMsg("Insufficient credits on account")), true);
 });
 
+test("provider type-token and ChatGPT-plan usage limits are quota (no retry spam)", () => {
+	const samples = [
+		// JSON envelopes whose bodies may not even mention a limit
+		'429: {"type":"GoUsageLimitError","message":"5-hour usage limit reached. Resets in 7 days. To continue using this model now, enable usage from your available balance"}',
+		'429: {"type":"FreeUsageLimitError","message":"Error from provider (Console): Rate limit"}',
+		// ChatGPT / Codex plan phrasing
+		"Codex error: The usage limit has been reached",
+		"You have reached your usage limit for ChatGPT Plus",
+		"usage limit hit, try again in ~60 min.",
+	];
+	for (const text of samples) {
+		assert.equal(patterns.hasQuotaExhaustedError(errMsg(text)), true, `expected quota: ${text}`);
+		assert.equal(patterns.hasRetryableError(errMsg(text)), false, `expected non-retryable: ${text}`);
+	}
+});
+
+test("parseResetWindowMs extracts the stated reset window", () => {
+	const MIN = 60_000;
+	const cases = [
+		["You have hit your ChatGPT usage limit (plus plan). Try again in ~135 min.", 135 * MIN],
+		["You have hit your ChatGPT usage limit (plus plan). Try again in ~117 min.", 117 * MIN],
+		["usage limit hit, try again in ~2 hours", 2 * 3600_000],
+		["please retry after 90 minutes", 90 * MIN],
+		["Monthly usage limit reached. Resets in 7 days.", 7 * 24 * 3600_000],
+		["5-hour usage limit reached", 5 * 3600_000],
+	];
+	for (const [text, expected] of cases) {
+		assert.equal(patterns.parseResetWindowMs(text), expected, `expected ${expected}ms for: ${text}`);
+	}
+	const none = [
+		"usage_limit_reached",
+		"too many requests, try again in 20 seconds",
+		"You have hit your usage limit · resets 4pm (Asia/Kuala_Lumpur)",
+		'429: {"type":"FreeUsageLimitError","message":"Console upstream refused"}',
+		"",
+	];
+	for (const text of none) {
+		assert.equal(patterns.parseResetWindowMs(text), null, `expected no window for: ${text}`);
+	}
+});
+
 test("context overflow defers to compaction instead of retrying", () => {
 	const overflow = [
 		"prompt is too long: 250000 tokens > 200000 maximum",

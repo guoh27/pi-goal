@@ -46,11 +46,14 @@ test("ContinuationState completes and resets", () => {
 
 test("resolveRetryConfig reads env overrides with pi-retry defaults", () => {
 	const defaults = resolveRetryConfig({});
-	assert.deepEqual(defaults, { enabled: true, baseDelayMs: 2000, maxDelayMs: 60000 });
+	assert.deepEqual(defaults, { enabled: true, baseDelayMs: 2000, maxDelayMs: 60000, quotaWaitMaxMs: 8 * 3600_000, quotaWaitMaxRounds: 3 });
 	assert.deepEqual(resolveRetryConfig({ PI_GOAL_RETRY_BASE_DELAY_MS: "500" }).baseDelayMs, 500);
 	assert.deepEqual(resolveRetryConfig({ PI_GOAL_RETRY_ENABLED: "false" }).enabled, false);
+	assert.deepEqual(resolveRetryConfig({ PI_GOAL_QUOTA_WAIT_MAX_MS: "3600000" }).quotaWaitMaxMs, 3600000);
+	assert.deepEqual(resolveRetryConfig({ PI_GOAL_QUOTA_WAIT_MAX_ROUNDS: "5" }).quotaWaitMaxRounds, 5);
 	// Invalid values fall back to defaults.
 	assert.deepEqual(resolveRetryConfig({ PI_GOAL_RETRY_MAX_DELAY_MS: "nope" }).maxDelayMs, 60000);
+	assert.deepEqual(resolveRetryConfig({ PI_GOAL_QUOTA_WAIT_MAX_MS: "nope" }).quotaWaitMaxMs, 8 * 3600_000);
 });
 
 function errMsg(text) {

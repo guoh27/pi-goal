@@ -73,6 +73,7 @@ export type CoordinatorEvent =
 	| { type: "fired"; reason: AutonomousReason; generation: number }
 	| { type: "dropped"; reason: AutonomousReason; why: "stale-generation" | "guard-rejected"; generation: number }
 	| { type: "displaced"; reason: AutonomousReason; by: AutonomousReason }
+	| { type: "canceled"; reason: AutonomousReason; why: string; generation: number }
 	| { type: "invalidated"; reason: string; count: number; generation: number };
 
 export class ContinuationCoordinator {
@@ -153,7 +154,10 @@ export class ContinuationCoordinator {
 	 */
 	requestTurn(request: { reason: AutonomousReason; delayMs?: number; execute: () => void }): boolean {
 		if (!Number.isFinite(request.delayMs) || (request.delayMs ?? 0) < 0) request.delayMs = 0;
-		const delayMs = request.delayMs ?? 0;
+		// Clamp at the max setTimeout supports: beyond ~24.8 days Node fires the
+		// timer immediately, which would turn an over-long quota wait into an
+		// instant retry.
+		const delayMs = Math.min(request.delayMs ?? 0, 0x7fffffff);
 		const priority = PRIORITY[request.reason];
 
 		if (this.scheduled) {
@@ -204,11 +208,20 @@ export class ContinuationCoordinator {
 		void fireAt;
 	}
 
-	/** Manually cancel the pending action without bumping the generation. */
-	cancelPending(): boolean {
+	/**
+	 * Manually cancel the pending action without bumping the generation.
+	 * With a filter, only a pending action whose reason passes is cancelled
+	 * (used to drop stale recovery turns once a run settles normally).
+	 * Returns true when something was cancelled.
+	 */
+	cancelPending(filter?: (reason: AutonomousReason) => boolean): boolean {
 		if (!this.scheduled) return false;
+		if (filter && !filter(this.scheduled.reason)) return false;
+		const reason = this.scheduled.reason;
+		const generation = this.scheduled.generation;
 		this.clearTimeoutFn(this.scheduled.timerId);
 		this.scheduled = null;
+		this.emit({ type: "canceled", reason, why: "manual", generation });
 		return true;
 	}
 

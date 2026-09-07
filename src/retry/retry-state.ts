@@ -26,8 +26,13 @@ export function formatDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
 	const minutes = Math.floor(ms / 60000);
-	const seconds = ((ms % 60000) / 1000).toFixed(0);
-	return `${minutes}m ${seconds}s`;
+	if (minutes < 60) {
+		const seconds = ((ms % 60000) / 1000).toFixed(0);
+		return `${minutes}m ${seconds}s`;
+	}
+	const hours = Math.floor(minutes / 60);
+	const rest = minutes % 60;
+	return rest > 0 ? `${hours}h ${rest}m` : `${hours}h`;
 }
 
 /**
@@ -116,7 +121,16 @@ export interface RetryEngineConfig {
 	enabled: boolean;
 	baseDelayMs: number;
 	maxDelayMs: number;
+	/** Longest accepted usage-limit reset window ("try again in ~N min") before falling back to an instant halt. */
+	quotaWaitMaxMs: number;
+	/** Consecutive windowed quota waits before giving up and halting. */
+	quotaWaitMaxRounds: number;
 }
+
+export const DEFAULT_QUOTA_WAIT_MAX_MS = 8 * 3600_000; // 8h
+// 3 rounds ≈ a full day of background patience for ChatGPT-plan style limits
+// before the auto loop gives up and halts with a notification.
+export const DEFAULT_QUOTA_WAIT_MAX_ROUNDS = 3;
 
 function positiveInt(value: string | undefined, fallback: number): number {
 	if (value == null) return fallback;
@@ -130,5 +144,7 @@ export function resolveRetryConfig(env: Record<string, string | undefined> = pro
 		enabled: env.PI_GOAL_RETRY_ENABLED !== "false" && env.PI_GOAL_RETRY_ENABLED !== "0",
 		baseDelayMs: positiveInt(env.PI_GOAL_RETRY_BASE_DELAY_MS, DEFAULT_BACKOFF_CONFIG.baseDelayMs),
 		maxDelayMs: positiveInt(env.PI_GOAL_RETRY_MAX_DELAY_MS, DEFAULT_BACKOFF_CONFIG.maxDelayMs),
+		quotaWaitMaxMs: positiveInt(env.PI_GOAL_QUOTA_WAIT_MAX_MS, DEFAULT_QUOTA_WAIT_MAX_MS),
+		quotaWaitMaxRounds: positiveInt(env.PI_GOAL_QUOTA_WAIT_MAX_ROUNDS, DEFAULT_QUOTA_WAIT_MAX_ROUNDS),
 	};
 }

@@ -72,7 +72,8 @@ pi-goal includes the former [pi-retry](https://github.com/monotykamary/pi-retry)
 
 - every provider error is retried by default (`stopReason === "error"`), indefinitely, with exponential backoff `2s → 4s → 8s → … → capped at 60s`
 - permanent failures are never retried: invalid API key, unknown model, suspended account
-- quota / session-limit / budget exhaustion is a hard stop (fix billing or wait for the reset window, then `/retry`)
+- quota / session-limit / budget exhaustion never triggers short backoff spam: if the error names a reset window ("Try again in ~135 min.", "resets in ~2 hours") ONE retry is scheduled at the stated reset time (immediate retries would only fail); without a window, or with a window beyond the 8h cap ("Resets in 7 days"), it is a hard stop (fix billing or wait, then `/retry`). Consecutive windowed waits are bounded (3 rounds), then the loop halts
+- a normal stop is never retried: when the model completes a turn successfully, any recovery turn still pending from an earlier failure is cancelled — "Retry the previous request." never follows a finished answer
 - HTTP 400/413, credit/payment transients, network / connection / timeout / socket errors all retry
 - context-overflow errors defer to pi's compaction instead of blind retrying
 - `stopReason === "length"` auto-continues without repeating content (uncapped — each chunk is real output)
@@ -190,6 +191,8 @@ Defaults preserve existing behavior; everything is tunable via environment varia
 | `PI_GOAL_RETRY_ENABLED` | `true` | master switch for the built-in retry engine |
 | `PI_GOAL_RETRY_BASE_DELAY_MS` | `2000` | first backoff delay |
 | `PI_GOAL_RETRY_MAX_DELAY_MS` | `60000` | backoff cap |
+| `PI_GOAL_QUOTA_WAIT_MAX_MS` | `28800000` (8h) | longest accepted usage-limit reset window before the quota error halts instantly |
+| `PI_GOAL_QUOTA_WAIT_MAX_ROUNDS` | `3` | consecutive reset-window waits per streak before giving up and halting |
 | `PI_GOAL_BACKGROUND_ENABLED` | `true` | background-aware waiting |
 | `PI_GOAL_BG_WAIT_TIMEOUT_MS` | `900000` (15 min) | fallback inactivity timeout while waiting |
 | `PI_GOAL_BG_WAKE_GRACE_MS` | `1000` | debounce after the last terminal event before a fallback wake |

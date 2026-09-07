@@ -20,6 +20,7 @@ import {
 	isContextOverflowError,
 	isNonRetryableError,
 	isSilencedError,
+	parseResetWindowMs,
 	type AssistantMessageLike,
 	type ErrorCategory,
 } from "./error-patterns.ts";
@@ -27,6 +28,8 @@ import {
 	calculateDelay,
 	ContinuationState,
 	DEFAULT_BACKOFF_CONFIG,
+	DEFAULT_QUOTA_WAIT_MAX_MS,
+	DEFAULT_QUOTA_WAIT_MAX_ROUNDS,
 	formatDuration,
 	resolveRetryConfig,
 	RetryState,
@@ -86,12 +89,22 @@ export class RetryEngine {
 	private readonly stateCredit = new RetryState();
 	private readonly stateConnection = new RetryState();
 	private readonly stateOther = new RetryState();
+	private readonly stateQuotaWait = new RetryState();
 	private readonly stateContinuation = new ContinuationState();
 	private readonly stateEmptyStop = new ContinuationState();
 
 	constructor(config: RetryEngineConfig = resolveRetryConfig()) {
-		this.config = config;
-		this.backoff = { baseDelayMs: config.baseDelayMs, maxDelayMs: config.maxDelayMs, multiplier: DEFAULT_BACKOFF_CONFIG.multiplier };
+		// Spread over full defaults so partial config injection (tests) cannot
+		// leave undefined timing fields behind.
+		this.config = {
+			enabled: true,
+			baseDelayMs: DEFAULT_BACKOFF_CONFIG.baseDelayMs,
+			maxDelayMs: DEFAULT_BACKOFF_CONFIG.maxDelayMs,
+			quotaWaitMaxMs: DEFAULT_QUOTA_WAIT_MAX_MS,
+			quotaWaitMaxRounds: DEFAULT_QUOTA_WAIT_MAX_ROUNDS,
+			...(config as Partial<RetryEngineConfig>),
+		};
+		this.backoff = { baseDelayMs: this.config.baseDelayMs, maxDelayMs: this.config.maxDelayMs, multiplier: DEFAULT_BACKOFF_CONFIG.multiplier };
 	}
 
 	getConfig(): RetryEngineConfig {
@@ -137,12 +150,22 @@ export class RetryEngine {
 		return this.stateEmptyStop.getCount();
 	}
 
+	/** Consecutive windowed usage-limit waits scheduled so far (reset on success/abort). */
+	getQuotaWaitCount(): number {
+		return this.stateQuotaWait.getAttempt();
+	}
+
 	/**
 	 * Plan the recovery action for a classified outcome. Mutates the internal
 	 * streak counters exactly once per planned action.
 	 */
 	planRecovery(outcome: ClassifiedOutcome): RecoveryPlan {
 		switch (outcome.kind) {
+			case "normal":
+			case "none":
+				// A genuine normal stop is a SUCCESS, never a retry target: the model
+				// completed its turn, so "Retry the previous request." must not follow.
+				return { ...outcome, action: "stop", delayMs: 0 };
 			case "length": {
 				this.stateContinuation.startContinuation();
 				const plan: RecoveryPlan = {
@@ -197,13 +220,47 @@ export class RetryEngine {
 				};
 			}
 			case "error_quota": {
+				const errorMessage = outcome.errorMessage ?? "";
+				// Quota errors that name a reset window ("Try again in ~135 min.",
+				// "resets in ~2 hours") make immediate backoff pointless: every retry
+				// fails until the window passes. Schedule ONE retry at the reset time
+				// instead of either spamming short retries or halting instantly.
+				const windowMs = parseResetWindowMs(errorMessage);
+				if (windowMs != null && windowMs <= this.config.quotaWaitMaxMs) {
+					this.stateQuotaWait.startRetry(errorMessage);
+					const attempt = this.stateQuotaWait.getAttempt();
+					this.stateQuotaWait.endRetry();
+					if (attempt > this.config.quotaWaitMaxRounds) {
+						this.stateQuotaWait.reset();
+						return {
+							...outcome,
+							action: "halt_goal_notify",
+							delayMs: 0,
+							notify: {
+								level: "error",
+								text: `Still usage-limited after ${this.config.quotaWaitMaxRounds} scheduled wait(s) — giving up on the auto loop. Wait out the limit or fix the plan/billing, then /retry: ${errorMessage.substring(0, 100)}`,
+							},
+						};
+					}
+					return {
+						...outcome,
+						action: "retry",
+						delayMs: windowMs,
+						attempt,
+						triggerContent: RETRY_TRIGGER_CONTENT,
+						notify: {
+							level: "info",
+							text: `Usage limit hit — immediate retries would keep failing. Waiting ${formatDuration(windowMs)} until the stated reset window, then retrying once (round ${attempt}/${this.config.quotaWaitMaxRounds}).`,
+						},
+					};
+				}
 				return {
 					...outcome,
 					action: "halt_goal_notify",
 					delayMs: 0,
 					notify: {
 						level: "error",
-						text: `Quota/limit exhausted — not retrying (fix plan/billing or wait for the reset window, then /retry): ${(outcome.errorMessage ?? "").substring(0, 100)}`,
+						text: `Quota/limit exhausted — not retrying (fix plan/billing or wait for the reset window, then /retry): ${errorMessage.substring(0, 100)}`,
 					},
 				};
 			}
@@ -243,6 +300,7 @@ export class RetryEngine {
 		this.stateCredit.succeed();
 		this.stateConnection.succeed();
 		this.stateOther.succeed();
+		this.stateQuotaWait.succeed();
 		this.stateContinuation.complete();
 		this.stateEmptyStop.complete();
 	}
@@ -253,6 +311,7 @@ export class RetryEngine {
 		this.stateCredit.reset();
 		this.stateConnection.reset();
 		this.stateOther.reset();
+		this.stateQuotaWait.reset();
 		this.stateContinuation.endContinuation();
 		this.stateEmptyStop.endContinuation();
 	}
@@ -286,6 +345,8 @@ function categoryLabel(category: ErrorCategory | undefined): string {
 			return "Connection";
 		case "builtin":
 			return "Server";
+		case "quota":
+			return "Usage limit";
 		default:
 			return "Other";
 	}

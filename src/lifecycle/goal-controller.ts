@@ -186,6 +186,15 @@ export class GoalController {
 		switch (outcome.kind) {
 			case "normal":
 				this.engine.noteSuccess();
+				// A genuine normal stop is a SUCCESS and ends the recovery story:
+				// drop any recovery turn still pending from an earlier failure (e.g. a
+				// provider_retry timer armed before a compaction-continued run settled
+				// successfully). "Retry the previous request." must never fire after a
+				// run the model actually completed. Goal continuation is unaffected —
+				// it is decided fresh at settle() with nothing pending.
+				this.coordinator.cancelPending(
+					(reason) => reason === "provider_retry" || reason === "max_tokens_continue" || reason === "empty_response_nudge",
+				);
 				return outcome; // continuation decision happens at settle()
 			case "none":
 			case "aborted":

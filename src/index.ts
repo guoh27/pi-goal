@@ -19,6 +19,7 @@ import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage.ts";
 import { ContinuationCoordinator, type AutonomousReason, type CoordinatorEvent } from "./lifecycle/continuation-coordinator.ts";
 import { RetryEngine } from "./retry/retry-engine.ts";
 import { formatDuration, resolveRetryConfig } from "./retry/retry-state.ts";
+import { parseResetWindowMs } from "./retry/error-patterns.ts";
 import { BackgroundWorkManager } from "./background/manager.ts";
 import { installAgentAbortHook, setAgentAbortHandler, setTriggerTurnGuard, getLiveAgentSession } from "./lifecycle/agent-abort-hook.ts";
 import { installBuiltinRetryGuard, setRecoveryActivityCheck } from "./lifecycle/builtin-retry-guard.ts";
@@ -175,7 +176,7 @@ export default function piGoal(pi: ExtensionAPI) {
 	let userAborted = false;
 	// Observable build marker (also printed by /retry status) so a running pi
 	// process can be verified as loading THIS code, not a stale copy.
-	const __PI_GOAL_VERSION__ = "0.2.0-merge+stopwake";
+	const __PI_GOAL_VERSION__ = "0.2.1-merge+normalstop-quotawait";
 	// Set true once an abort hook fired; avoids redundant processing when the
 	// same abort also surfaces as turn_end(aborted).
 	let userAbortedEstablished = false;
@@ -256,6 +257,13 @@ export default function piGoal(pi: ExtensionAPI) {
 			return;
 		}
 		if (event.type === "dropped" && event.reason === "provider_retry" && activeRetryLifecycleId != null) {
+			pi.events.emit(RETRY_CANCELLED_EVENT, { retryId: activeRetryLifecycleId });
+			activeRetryLifecycleId = null;
+			return;
+		}
+		if (event.type === "canceled" && event.reason === "provider_retry" && activeRetryLifecycleId != null) {
+			// e.g. a run settled normally while a stale retry was pending — the
+			// recovery is over without ever firing, so the lifecycle closes cancelled.
 			pi.events.emit(RETRY_CANCELLED_EVENT, { retryId: activeRetryLifecycleId });
 			activeRetryLifecycleId = null;
 		}
@@ -686,9 +694,30 @@ export default function piGoal(pi: ExtensionAPI) {
 					case "error_overflow":
 						ctx.ui.notify("Context overflow — use /compact (or /pi-vcc) to reduce context. Compaction auto-retries.", "info");
 						return;
-					case "error_quota":
-						ctx.ui.notify(`Quota/limit exhausted — resolve the plan/billing issue or wait for the reset window first: ${(outcome.errorMessage ?? "").substring(0, 100)}`, "warning");
+					case "error_quota": {
+						const errorMessage = outcome.errorMessage ?? "";
+						const windowMs = parseResetWindowMs(errorMessage);
+						if (windowMs != null) {
+							const capMs = retryEngine.getConfig().quotaWaitMaxMs;
+							if (windowMs <= capMs) {
+								const waitScheduled = coordinator.getPending()?.reason === "provider_retry";
+								ctx.ui.notify(
+									waitScheduled
+										? `Usage limit hit (~${formatDuration(windowMs)}) — one automatic retry is scheduled after the reset window. /retry reset cancels it; a new message retries earlier.`
+										: `Usage limit hit (~${formatDuration(windowMs)}) — immediate retries would keep failing; the auto-loop retries once after the reset window when it is active. Resolve the limit and resume (/goal resume) to try earlier.`,
+									"warning",
+								);
+								return;
+							}
+							ctx.ui.notify(
+								`Usage limit hit — the stated reset window (~${formatDuration(windowMs)}) is beyond the auto-wait cap (${formatDuration(capMs)}), so no wait is scheduled. Resolve the limit and resume manually.`,
+								"warning",
+							);
+							return;
+						}
+						ctx.ui.notify(`Quota/limit exhausted — resolve the plan/billing issue or wait for the reset window first: ${errorMessage.substring(0, 100)}`, "warning");
 						return;
+					}
 					case "error_permanent":
 						if (outcome.errorMessage && /cannot continue from message role/i.test(outcome.errorMessage)) return;
 						ctx.ui.notify(`Non-retryable error (fix the underlying issue first, then /retry): ${(outcome.errorMessage ?? "").substring(0, 100)}`, "warning");
@@ -742,6 +771,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			"",
 			`Retry engine: ${retryEngine.getConfig().enabled ? "enabled" : "disabled"}`,
 			`Backoff: ${formatDuration(retryEngine.getConfig().baseDelayMs)} → ... → ${formatDuration(retryEngine.getConfig().maxDelayMs)} (×2, indefinite until success)`,
+			`Usage-limit reset waits: ${retryEngine.getQuotaWaitCount()} used (max ${retryEngine.getConfig().quotaWaitMaxRounds} per streak · window cap ${formatDuration(retryEngine.getConfig().quotaWaitMaxMs)})`,
 			`400/413 attempts: ${retryEngine.lastCategoryFor("400-413").getAttempt()} · last: ${retryEngine.lastCategoryFor("400-413").getLastErrorMessage().substring(0, 80) || "None"}`,
 			`Credit attempts: ${retryEngine.lastCategoryFor("credit").getAttempt()} · last: ${retryEngine.lastCategoryFor("credit").getLastErrorMessage().substring(0, 80) || "None"}`,
 			`Connection attempts: ${retryEngine.lastCategoryFor("connection").getAttempt()} · last: ${retryEngine.lastCategoryFor("connection").getLastErrorMessage().substring(0, 80) || "None"}`,

@@ -4,9 +4,11 @@
  *
  * Philosophy: retry EVERY provider error by default. The only skips are a tiny
  * blacklist of known permanent failures (invalid API key, missing model, ...)
- * and hard-stop quota/session-limit/budget exhaustion. Everything else —
- * 400s, connection issues, credit errors, stream exhaustion, provider
- * hiccups, unknown errors — is retried.
+ * and hard-stop quota/session-limit/budget exhaustion. Quota errors that name
+ * a reset window ("Try again in ~135 min.") are NOT skipped: the engine
+ * schedules ONE retry at the reset time. Everything else — 400s, connection
+ * issues, credit errors, stream exhaustion, provider hiccups, unknown errors —
+ * is retried with backoff.
  *
  * Context-overflow errors are NOT retried here: a hidden retry would resend
  * the same oversized context and overflow again. Pi core detects overflow,
@@ -143,11 +145,16 @@ const SILENCED_PATTERNS = [/cannot continue from message role/i];
 // balance errors, which stay retryable. See upstream pi-retry for the full
 // evidence list of real provider messages matched here.
 export const QUOTA_EXHAUSTED_PATTERNS = [
+	// Provider error-type markers inside JSON envelopes, e.g.
+	// `429: {"type":"GoUsageLimitError","message":"..."}` (opencode/codex/console
+	// gateways) — the message body may not contain any quota phrasing at all.
+	/(?:go|free)usagelimiterror/i,
 	// Session / usage limits with reset windows (Claude, Codex, ChatGPT plans)
 	/hit your (?:[a-z]+ )?usage limit/i,
 	/hit your limit/i,
 	/usage_limit_reached/i,
-	/usage\s*limit\s*(has\s*been\s*)?reached/i,
+	/usage\s*limit\s*(?:has\s*been\s*)?(?:reached|hit|exceeded)/i,
+	/reached (?:your|the) (?:chatgpt|codex|openai|api\s*)?usage limit/i,
 	/hour\s*limit\s*reached/i,
 	/limit\s*will\s*reset\s*at/i,
 	/session\s*(limit|quota)/i,
@@ -182,6 +189,30 @@ export const QUOTA_EXHAUSTED_PATTERNS = [
 
 export function isAssistantMessage(message: unknown): message is AssistantMessageLike {
 	return Boolean(message) && typeof message === "object" && (message as AssistantMessageLike).role === "assistant";
+}
+
+/**
+ * Parse a reset window out of quota/limit error text, e.g.
+ * "Try again in ~135 min.", "resets in ~2 hours", "5-hour usage limit reached",
+ * "Resets in 7 days.". Returns the window in ms, or null when the text names no
+ * usable window (callers then treat the quota error as a plain hard stop).
+ * Seconds and bare "4pm" style times deliberately do NOT match — waiting is
+ * only worthwhile for hour-scale windows that providers state explicitly.
+ */
+export function parseResetWindowMs(errorMessage: string): number | null {
+	if (!errorMessage) return null;
+	const text = errorMessage;
+	// "try again in ~135 min" / "resets in ~2 hours" / "retry after 90 minutes" / "Resets in 7 days"
+	const match =
+		/(?:again|reset|resets|retry|wait|until|in|after|within)\b[^.;\n]{0,40}?~?\s*(\d+(?:\.\d+)?)\s*(minutes?|mins?|hours?|hrs?|days?)\b/i.exec(text) ??
+		// "5-hour usage limit" / "3-hour reset window"
+		/(\d+(?:\.\d+)?)\s*-\s*(minutes?|hours?|days?)\b/i.exec(text);
+	if (!match) return null;
+	const value = Number(match[1]);
+	if (!Number.isFinite(value) || value <= 0) return null;
+	const unit = match[2].toLowerCase();
+	const factor = unit.startsWith("day") ? 24 * 3600_000 : unit.startsWith("hour") || unit.startsWith("hr") ? 3600_000 : 60_000;
+	return Math.round(value * factor);
 }
 
 function errorTextOf(message: AssistantMessageLike): string | null {
