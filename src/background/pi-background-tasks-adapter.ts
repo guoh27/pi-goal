@@ -182,6 +182,9 @@ export class PiBackgroundTasksAdapter implements BackgroundWorkProvider {
 		return new Promise((resolve) => {
 			let settled = false;
 			const requestId = nextRequestId();
+			// `let` before `finish`: a synchronously-invoked handler must never
+			// read `unsubscribe` in its TDZ.
+			let unsubscribe: (() => void) | undefined;
 			const finish = (value: { ok: boolean; value?: unknown }) => {
 				if (settled) return;
 				settled = true;
@@ -191,19 +194,26 @@ export class PiBackgroundTasksAdapter implements BackgroundWorkProvider {
 			};
 
 			const timer = setTimeout(() => finish({ ok: false }), this.queryTimeoutMs);
-			const unsubscribe = this.events.on(BG_RESPONSE_CHANNEL, (data) => {
-				const response = data as BgResponseLike | undefined;
-				if (!isRecord(response) || response.request_id !== requestId) return;
-				if (response.ok !== true) finish({ ok: false });
-				else finish({ ok: true, value: response.result });
-			});
+			try {
+				const off = this.events.on(BG_RESPONSE_CHANNEL, (data) => {
+					const response = data as BgResponseLike | undefined;
+					if (!isRecord(response) || response.request_id !== requestId) return;
+					if (response.ok !== true) finish({ ok: false });
+					else finish({ ok: true, value: response.result });
+				});
+				unsubscribe = typeof off === "function" ? off : undefined;
 
-			this.events.emit(BG_REQUEST_CHANNEL, {
-				schema_version: BG_REQUEST_SCHEMA,
-				request_id: requestId,
-				operation,
-				payload,
-			});
+				this.events.emit(BG_REQUEST_CHANNEL, {
+					schema_version: BG_REQUEST_SCHEMA,
+					request_id: requestId,
+					operation,
+					payload,
+				});
+			} catch {
+				// The captured bus is stale after session replacement/reload and
+				// throws on use — fail closed instead of an unhandled rejection.
+				finish({ ok: false });
+			}
 		});
 	}
 }

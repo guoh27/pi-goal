@@ -158,6 +158,9 @@ export class PiSubagentsAdapter implements BackgroundWorkProvider {
 			let settled = false;
 			const requestId = nextRequestId();
 			const replyChannel = `subagents:rpc:v1:reply:${requestId}`;
+			// `let` before `finish`: a synchronously-invoked handler must never
+			// read `unsubscribe` in its TDZ.
+			let unsubscribe: (() => void) | undefined;
 			const finish = (value: { ok: boolean; value?: unknown }) => {
 				if (settled) return;
 				settled = true;
@@ -167,21 +170,28 @@ export class PiSubagentsAdapter implements BackgroundWorkProvider {
 			};
 
 			const timer = setTimeout(() => finish({ ok: false }), this.queryTimeoutMs);
-			const unsubscribe = this.events.on(replyChannel, (data) => {
-				const reply = data as RpcReplyLike | undefined;
-				if (!isRecord(reply) || reply.requestId !== requestId) return;
-				if (reply.version !== RPC_PROTOCOL_VERSION) return finish({ ok: false });
-				if (reply.success !== true) finish({ ok: false });
-				else finish({ ok: true, value: reply.data });
-			});
+			try {
+				const off = this.events.on(replyChannel, (data) => {
+					const reply = data as RpcReplyLike | undefined;
+					if (!isRecord(reply) || reply.requestId !== requestId) return;
+					if (reply.version !== RPC_PROTOCOL_VERSION) return finish({ ok: false });
+					if (reply.success !== true) finish({ ok: false });
+					else finish({ ok: true, value: reply.data });
+				});
+				unsubscribe = typeof off === "function" ? off : undefined;
 
-			this.events.emit(SUBAGENT_RPC_REQUEST_EVENT, {
-				version: RPC_PROTOCOL_VERSION,
-				requestId,
-				method,
-				params,
-				source: { extension: "pi-goal" },
-			});
+				this.events.emit(SUBAGENT_RPC_REQUEST_EVENT, {
+					version: RPC_PROTOCOL_VERSION,
+					requestId,
+					method,
+					params,
+					source: { extension: "pi-goal" },
+				});
+			} catch {
+				// The captured bus is stale after session replacement/reload and
+				// throws on use — fail closed instead of an unhandled rejection.
+				finish({ ok: false });
+			}
 		});
 	}
 }

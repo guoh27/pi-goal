@@ -203,3 +203,53 @@ test("manager.subscribeAll wires change signals from built-in adapters", async (
 	bus.emit("pi-background-tasks:terminal:v1", { schema_version: "x", task: { id: "z" } });
 	assert.equal(signals, 2);
 });
+
+test("stale ctx bus (on/emit throw after session replacement) fails closed, never rejects", async () => {
+	// Simulates pi's session-bound event bus after ctx.newSession()/reload():
+	// every use throws the stale-ctx error from the extension runtime.
+	const staleBus = {
+		on() {
+			throw new Error("This extension ctx is stale after session replacement or reload.");
+		},
+		emit() {
+			throw new Error("This extension ctx is stale after session replacement or reload.");
+		},
+	};
+	const unhandled = [];
+	const onUnhandled = (err) => unhandled.push(err);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		// Constructor subscriptions throw too — that's out of scope here; build
+		// adapters against a healthy bus, then swap to the stale one.
+		const bus = makeBus();
+		respondOk(bus);
+		const bg = new PiBackgroundTasksAdapter(bus, { queryTimeoutMs: 20, probeRetryDelayMs: 10 });
+		const sa = new PiSubagentsAdapter(bus, { queryTimeoutMs: 20, probeRetryDelayMs: 10 });
+		await flush();
+		bg.events = staleBus;
+		sa.events = staleBus;
+
+		const snapBg = await bg.getActiveWork("s1");
+		const snapSa = await sa.getActiveWork("s1");
+		assert.equal(snapBg.state, "unknown");
+		assert.equal(snapSa.state, "unknown");
+		await flush(50); // give any stray rejection a chance to surface
+		assert.deepEqual(unhandled, []);
+	} finally {
+		process.removeListener("unhandledRejection", onUnhandled);
+	}
+
+	function respondOk(busRef) {
+		busRef.on(BG_REQUEST_CHANNEL, (request) => {
+			busRef.emit(BG_RESPONSE_CHANNEL, { request_id: request.request_id, ok: true, result: { tasks: [] } });
+		});
+		busRef.on(SUBAGENT_RPC_REQUEST_EVENT, (request) => {
+			busRef.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+				version: 1,
+				requestId: request.requestId,
+				success: true,
+				data: { fleet: { totalActive: 0, entries: [] } },
+			});
+		});
+	}
+});
