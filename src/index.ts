@@ -1,7 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { Box, Spacer, Text, matchesKey } from "@mariozechner/pi-tui";
-import { Agent } from "@earendil-works/pi-agent-core";
 import {
 	accountGoalTurn,
 	createGoalState,
@@ -21,8 +20,8 @@ import { RetryEngine } from "./retry/retry-engine.ts";
 import { formatDuration, resolveRetryConfig } from "./retry/retry-state.ts";
 import { parseResetWindowMs } from "./retry/error-patterns.ts";
 import { BackgroundWorkManager } from "./background/manager.ts";
-import { bindAgentSessionHooks, installAgentAbortHook, getLiveAgentSession } from "./lifecycle/agent-abort-hook.ts";
-import { installBuiltinRetryGuard, setRecoveryActivityCheck } from "./lifecycle/builtin-retry-guard.ts";
+import { bindAgentSessionHooks, installAgentAbortHook, getLiveAgentSession, removeTrailingErrorForSession } from "./lifecycle/agent-abort-hook.ts";
+import { installBuiltinRetryGuard, bindRecoveryActivityCheck } from "./lifecycle/builtin-retry-guard.ts";
 import {
 	GoalController,
 	resolveGoalControllerConfig,
@@ -57,30 +56,8 @@ function getLastAssistantMessage(entries: unknown[]): Record<string, unknown> | 
 	return undefined;
 }
 
-// Capture the live Agent instance when AgentSession subscribes to it, so a
-// retry can drop the trailing error assistant message from live state (same
-// technique as upstream pi-retry and pi core's built-in retry).
-type LiveAgent = { state: { messages: Array<Record<string, unknown>> } };
-let liveAgent: LiveAgent | null = null;
-type SubscribeFn = (...args: unknown[]) => unknown;
-const agentSubscribe = Agent.prototype.subscribe as unknown as (SubscribeFn & { __piGoalPatched?: boolean }) | undefined;
-if (typeof agentSubscribe === "function" && !agentSubscribe.__piGoalPatched) {
-	const patched: SubscribeFn & { __piGoalPatched?: boolean } = function (this: unknown, ...args: unknown[]) {
-		liveAgent = this as LiveAgent;
-		return (agentSubscribe as SubscribeFn).apply(this, args);
-	};
-	patched.__piGoalPatched = true;
-	Agent.prototype.subscribe = patched as typeof Agent.prototype.subscribe;
-}
-
-function removeTrailingErrorFromAgentState(): void {
-	if (!liveAgent) return;
-	const messages = liveAgent.state.messages;
-	const lastMsg = messages[messages.length - 1];
-	if (lastMsg?.role === "assistant" && lastMsg.stopReason === "error") {
-		liveAgent.state.messages = messages.slice(0, -1);
-	}
-}
+// Retry cleanup drops the trailing error from the live agent state via the
+// per-session capture in agent-abort-hook (never a process-global agent).
 
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
@@ -276,18 +253,33 @@ export default function piGoal(pi: ExtensionAPI) {
 	// but registrations are session-scoped because pi-web hosts many sessions.
 	installAgentAbortHook();
 	let sessionHooksDisposer: (() => void) | null = null;
+	let recoveryCheckDisposer: (() => void) | null = null;
 	// While the merged engine owns recovery (pending action or driving phase),
 	// pi's builtin retry must step aside to avoid double-engine retry storms.
-	setRecoveryActivityCheck(
-		() =>
-			coordinator.hasPending() ||
-			coordinator.getPhase() === "retrying" ||
-			coordinator.getPhase() === "continuing",
+	// The check is bound per session at session_start (pi-web hosts many).
+	const recoveryActivityCheck = () =>
+		coordinator.hasPending() || coordinator.getPhase() === "retrying" || coordinator.getPhase() === "continuing";
+	const backgroundManager = new BackgroundWorkManager(
+		pi.events,
+		{
+			queryTimeoutMs: backgroundConfig.queryTimeoutMs,
+			probeRetryDelayMs: backgroundConfig.probeRetryDelayMs,
+		},
+		// pi-web official subagent records live in this session's journal.
+		// A throwing (stale) ctx propagates so the adapter fails closed.
+		() => {
+			if (!latestCtx) return [];
+			return latestCtx.sessionManager.getBranch() ?? [];
+		},
 	);
-	const backgroundManager = new BackgroundWorkManager(pi.events, {
-		queryTimeoutMs: backgroundConfig.queryTimeoutMs,
-		probeRetryDelayMs: backgroundConfig.probeRetryDelayMs,
-	});
+
+	function currentSessionId(): string | null {
+		try {
+			return latestCtx?.sessionManager.getSessionId() ?? null;
+		} catch {
+			return null;
+		}
+	}
 
 	const controller = new GoalController({
 		coordinator,
@@ -310,18 +302,14 @@ export default function piGoal(pi: ExtensionAPI) {
 				if (!goal || goal.status !== "active") return;
 				emitGoalEvent("continuation", goal, { triggerTurn: true, deliverAs: "followUp" });
 			},
-			removeTrailingErrorFromAgentState,
+			removeTrailingErrorFromAgentState() {
+				removeTrailingErrorForSession(currentSessionId());
+			},
 			isGoalActive: () => goal?.status === "active",
 			isGoalPresent: () => goal != null,
 			hasPendingMessages: () => latestCtx?.hasPendingMessages() ?? false,
 			isAgentBusy: () => !(latestCtx?.isIdle() ?? true),
-			getSessionId: () => {
-				try {
-					return latestCtx?.sessionManager.getSessionId() ?? null;
-				} catch {
-					return null;
-				}
-			},
+			getSessionId: () => currentSessionId(),
 			notify,
 			pauseGoalForHalt(reasonText: string) {
 				if (!goal || goal.status !== "active") return;
@@ -733,7 +721,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			reason,
 			delayMs: 0,
 			execute: () => {
-				if (options?.removeError) removeTrailingErrorFromAgentState();
+				if (options?.removeError) removeTrailingErrorForSession(currentSessionId());
 				controller.sendRecoveryTrigger(content);
 			},
 		});
@@ -801,6 +789,8 @@ export default function piGoal(pi: ExtensionAPI) {
 				},
 				shouldSuppressTriggerTurn: () => userAborted,
 			});
+			recoveryCheckDisposer?.();
+			recoveryCheckDisposer = bindRecoveryActivityCheck(ctx.sessionManager.getSessionId(), recoveryActivityCheck);
 			registerEscapeInterrupt(ctx);
 			const restored = latestStateFromSession(ctx);
 			goal = restored.goal;
@@ -837,6 +827,8 @@ export default function piGoal(pi: ExtensionAPI) {
 			captureCtx(ctx);
 			sessionHooksDisposer?.();
 			sessionHooksDisposer = null;
+			recoveryCheckDisposer?.();
+			recoveryCheckDisposer = null;
 			terminalInputDisposer?.();
 			terminalInputDisposer = null;
 			// Retire tasks still running at a session boundary so an old session's

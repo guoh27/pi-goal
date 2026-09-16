@@ -18,18 +18,30 @@
  */
 
 import { AgentSession } from "@earendil-works/pi-coding-agent";
+import { noteLiveAgentSession } from "./agent-abort-hook.ts";
 
 /** Returns true while the merged engine owns the recovery path. */
 export type RecoveryActivityCheck = () => boolean;
 
-let recoveryActive: RecoveryActivityCheck = () => false;
+const checksBySessionId = new Map<string, RecoveryActivityCheck>();
+// Backward-compatible fallback for non-session test harnesses.
+let fallbackCheck: RecoveryActivityCheck = () => false;
 
-export function setRecoveryActivityCheck(check: RecoveryActivityCheck | null): void {
-	recoveryActive = check ?? (() => false);
+/** Register the check for one session. The disposer removes this exact registration. */
+export function bindRecoveryActivityCheck(sessionId: string, check: RecoveryActivityCheck): () => void {
+	checksBySessionId.set(sessionId, check);
+	return () => {
+		if (checksBySessionId.get(sessionId) === check) checksBySessionId.delete(sessionId);
+	};
 }
 
-export function isRecoveryDriving(): boolean {
-	return recoveryActive();
+/** Legacy single-session fallback. Prefer bindRecoveryActivityCheck(). */
+export function setRecoveryActivityCheck(check: RecoveryActivityCheck | null): void {
+	fallbackCheck = check ?? (() => false);
+}
+
+export function isRecoveryDriving(sessionId?: string): boolean {
+	return (sessionId ? checksBySessionId.get(sessionId) : fallbackCheck)?.() ?? false;
 }
 
 type PrepareRetryFn = (this: unknown, message: unknown) => Promise<boolean>;
@@ -42,7 +54,9 @@ const origPrepareRetry = proto._prepareRetry;
 
 if (typeof origPrepareRetry === "function" && !origPrepareRetry.__piGoalRetryGuard) {
 	const patched: PrepareRetryFn & { __piGoalRetryGuard?: boolean } = function (this: unknown, message: unknown) {
-		if (isRecoveryDriving()) {
+		noteLiveAgentSession(this);
+		const sessionId = (this as { sessionId?: unknown } | null)?.sessionId;
+		if (isRecoveryDriving(typeof sessionId === "string" ? sessionId : undefined)) {
 			return Promise.resolve(false);
 		}
 		return origPrepareRetry.call(this, message);

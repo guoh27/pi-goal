@@ -30,6 +30,33 @@ function sessionIdOf(session: unknown): string | null {
 	return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+/** Record a live AgentSession so other patches can reach its agent per session. */
+export function noteLiveAgentSession(session: unknown): void {
+	const sessionId = sessionIdOf(session);
+	if (sessionId) liveAgentSessions.set(sessionId, session);
+	else fallbackLiveAgentSession = session;
+}
+
+type AgentWithMessages = { state: { messages: Array<Record<string, unknown>> } };
+
+/**
+ * Drop a trailing assistant error from the live agent state of ONE session
+ * (retry cleanup, same technique as upstream pi-retry). Never touches another
+ * session's agent. Returns true when a message was removed.
+ */
+export function removeTrailingErrorForSession(sessionId: string | null): boolean {
+	const session = (sessionId ? liveAgentSessions.get(sessionId) : fallbackLiveAgentSession) as
+		| { agent?: AgentWithMessages }
+		| null
+		| undefined;
+	const messages = session?.agent?.state?.messages;
+	if (!messages) return false;
+	const lastMsg = messages[messages.length - 1];
+	if (lastMsg?.role !== "assistant" || lastMsg.stopReason !== "error") return false;
+	session!.agent!.state.messages = messages.slice(0, -1);
+	return true;
+}
+
 /** Register hooks for one AgentSession. The disposer only removes this exact registration. */
 export function bindAgentSessionHooks(sessionId: string, hooks: AgentSessionHooks): () => void {
 	hooksBySessionId.set(sessionId, hooks);
@@ -83,10 +110,8 @@ const origAbort = proto.abort;
 
 if (typeof origAbort === "function" && !origAbort.__piGoalAbortHook) {
 	const patched: AbortFn & { __piGoalAbortHook?: boolean } = function (this: unknown) {
-		const sessionId = sessionIdOf(this);
-		if (sessionId) liveAgentSessions.set(sessionId, this);
-		else fallbackLiveAgentSession = this;
-		onAgentAbort(sessionId ?? undefined);
+		noteLiveAgentSession(this);
+		onAgentAbort(sessionIdOf(this) ?? undefined);
 		return origAbort.call(this);
 	};
 	patched.__piGoalAbortHook = true;
@@ -101,6 +126,7 @@ const origSendCustomMessage = proto.sendCustomMessage;
 
 if (typeof origSendCustomMessage === "function" && !origSendCustomMessage.__piGoalTriggerGuard) {
 	const patched: SendCustomMessageFn & { __piGoalTriggerGuard?: boolean } = async function (this: unknown, message, options) {
+		noteLiveAgentSession(this);
 		const sessionId = sessionIdOf(this);
 		const suppress = sessionId
 			? shouldSuppressTriggerTurnForSession(sessionId)

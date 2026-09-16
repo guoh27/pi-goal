@@ -49,6 +49,20 @@ test("session guards are isolated in a multi-session host such as pi-web", async
 	releaseB();
 });
 
+test("trailing error cleanup only touches the owning session's agent", async () => {
+	const hook = await jiti.import("../../src/lifecycle/agent-abort-hook.ts");
+	const errA = { role: "assistant", stopReason: "error" };
+	const errB = { role: "assistant", stopReason: "error" };
+	const agentA = { state: { messages: [{ role: "user" }, errA] } };
+	const agentB = { state: { messages: [{ role: "user" }, errB] } };
+	hook.noteLiveAgentSession({ sessionId: "session-a", agent: agentA });
+	hook.noteLiveAgentSession({ sessionId: "session-b", agent: agentB });
+
+	assert.equal(hook.removeTrailingErrorForSession("session-a"), true);
+	assert.deepEqual(agentA.state.messages, [{ role: "user" }]);
+	assert.equal(agentB.state.messages.length, 2, "another session's agent state must stay untouched");
+});
+
 test("abort hook fires during an active run too", async () => {
 	const { AgentSession } = await jiti.import("../../../node_modules/@earendil-works/pi-coding-agent/dist/index.js");
 	const hook = await jiti.import("../../src/lifecycle/agent-abort-hook.ts");

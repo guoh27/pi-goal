@@ -13,6 +13,7 @@
 
 import { PiBackgroundTasksAdapter } from "./pi-background-tasks-adapter.ts";
 import { PiSubagentsAdapter } from "./pi-subagents-adapter.ts";
+import { PiWebSubagentsAdapter, type JournalEntriesProvider } from "./pi-web-subagents-adapter.ts";
 import {
 	listBackgroundWorkProviders,
 	snapshotAllProviders,
@@ -38,12 +39,18 @@ export interface AggregatedSnapshot {
 export class BackgroundWorkManager {
 	readonly bgTasks: PiBackgroundTasksAdapter;
 	readonly subagents: PiSubagentsAdapter;
+	readonly webSubagents: PiWebSubagentsAdapter | null;
 	/** Active ids from the most recent snapshot (used for session-boundary retirement). */
 	lastActiveIds: string[] = [];
 
-	constructor(events: EventBusLike, options?: { queryTimeoutMs?: number; probeRetryDelayMs?: number }) {
+	constructor(
+		events: EventBusLike,
+		options?: { queryTimeoutMs?: number; probeRetryDelayMs?: number },
+		getEntries?: JournalEntriesProvider,
+	) {
 		this.bgTasks = new PiBackgroundTasksAdapter(events, options);
 		this.subagents = new PiSubagentsAdapter(events, options);
+		this.webSubagents = getEntries ? new PiWebSubagentsAdapter(getEntries) : null;
 	}
 
 	/**
@@ -76,7 +83,9 @@ export class BackgroundWorkManager {
 		// Built-ins are session-bound because each pi-web session has its own
 		// EventBus. Never take another session's adapters from the process-global
 		// third-party registry.
-		const builtins = [this.bgTasks, this.subagents].filter((provider) => provider.getAvailable());
+		const builtins = [this.bgTasks, this.subagents, ...(this.webSubagents ? [this.webSubagents] : [])].filter((provider) =>
+			provider.getAvailable(),
+		);
 		const builtinNames = new Set<string>(builtins.map((provider) => provider.name));
 		const thirdParty = listBackgroundWorkProviders().filter(
 			(provider) =>

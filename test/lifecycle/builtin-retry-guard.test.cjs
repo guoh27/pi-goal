@@ -29,3 +29,20 @@ test("guard installs a patched _prepareRetry on AgentSession.prototype", async (
 	assert.equal(guard.isRecoveryDriving(), false);
 	guard.setRecoveryActivityCheck(null);
 });
+
+test("recovery checks are isolated per session in a multi-session host", async () => {
+	const { AgentSession } = await jiti.import("../../../node_modules/@earendil-works/pi-coding-agent/dist/index.js");
+	const guard = await jiti.import("../../src/lifecycle/builtin-retry-guard.ts");
+
+	const releaseA = guard.bindRecoveryActivityCheck("session-a", () => true);
+	const releaseB = guard.bindRecoveryActivityCheck("session-b", () => false);
+
+	// Session A's engine driving must suppress only A's builtin retry.
+	const resultA = await AgentSession.prototype._prepareRetry.call({ sessionId: "session-a", _retryAttempt: 0 }, "boom");
+	assert.equal(resultA, false);
+	assert.equal(guard.isRecoveryDriving("session-a"), true);
+	assert.equal(guard.isRecoveryDriving("session-b"), false);
+
+	releaseA();
+	releaseB();
+});

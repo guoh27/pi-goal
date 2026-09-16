@@ -13,6 +13,10 @@ const {
 	PiSubagentsAdapter,
 	SUBAGENT_RPC_REQUEST_EVENT,
 } = jiti("../../src/background/pi-subagents-adapter.ts");
+const {
+	PiWebSubagentsAdapter,
+} = jiti("../../src/background/pi-web-subagents-adapter.ts");
+
 const { BackgroundWorkManager } = jiti("../../src/background/manager.ts");
 const { ensureBackgroundWorkRegistry, registerBackgroundWorkProvider, unknownSnapshot } = jiti(
 	"../../src/background/types.ts",
@@ -110,6 +114,42 @@ test("bg-tasks adapter: timeout / malformed response fail closed as unknown", as
 		bus.emit(BG_RESPONSE_CHANNEL, { schema_version: "x", request_id: request.request_id, operation: request.operation, ok: false, error: "boom" });
 	});
 	const snap2 = await adapter.getActiveWork("s1");
+	assert.equal(snap2.state, "unknown");
+});
+
+test("pi-web subagents adapter: journal records are authoritative; latest status wins", async () => {
+	const sub = (id, status) => ({ kind: "pi-web-subagent", sessionId: id, profile: "explore", status, runInBackground: true });
+	const toolResult = (tool, details) => ({ type: "message", message: { role: "toolResult", toolName: tool, details } });
+	const notification = (details) => ({ type: "custom_message", customType: "pi-web:subagent-notification", details });
+	const entries = [
+		toolResult("Agent", sub("a", "running")),
+		toolResult("Agent", sub("b", "running")),
+		notification(sub("a", "completed")),
+		toolResult("Agent", sub("c", "starting")),
+		// Foreground run: tool returns only at completion → terminal, not active.
+		toolResult("Agent", sub("d", "completed")),
+		// A get_subagent_result poll updates to the latest status.
+		toolResult("get_subagent_result", sub("b", "aborted")),
+		// Foreign records are ignored.
+		toolResult("bg_run", { id: "x" }),
+		{ type: "custom_message", customType: "background-task-notification", details: { id: "y" } },
+	];
+	const adapter = new PiWebSubagentsAdapter(() => entries);
+	const snap = await adapter.getActiveWork("s1");
+	assert.equal(snap.state, "known");
+	assert.deepEqual(snap.activeIds.sort(), ["c"]);
+	assert.equal(snap.activeCount, 1);
+});
+
+test("pi-web subagents adapter: empty or foreign journal means zero active, never unknown", async () => {
+	const adapter = new PiWebSubagentsAdapter(() => []);
+	const snap = await adapter.getActiveWork("s1");
+	assert.equal(snap.state, "known");
+	assert.equal(snap.activeCount, 0);
+	const broken = new PiWebSubagentsAdapter(() => {
+		throw new Error("stale ctx");
+	});
+	const snap2 = await broken.getActiveWork("s1");
 	assert.equal(snap2.state, "unknown");
 });
 
