@@ -1,56 +1,76 @@
 /**
- * Agent abort hook — makes every "stop" path observable to the extension.
+ * Agent abort hook — makes every "stop" path observable to the owning extension.
  *
- * Problem: pi-web's Stop button, TUI interrupts, and RPC abort all funnel
- * into `AgentSession.abort()`. During the retry backoff window the agent is
- * idle, so `agent.abort()` is a silent no-op and NO extension event fires —
- * a pending retry keeps its timer and fires seconds later. The user sees
- * "I pressed stop and a retry message appeared anyway."
- *
- * Fix: wrap `AgentSession.prototype.abort`. Any caller (TUI / pi-web / RPC /
- * wechat / extensions) triggers the registered handler first, which cancels
- * pending autonomous work and marks the process stopped. The original abort
- * still runs untouched afterwards.
+ * pi-web keeps multiple AgentSession instances in one Node process, so hook
+ * state must be keyed by session id. A process-global single handler lets one
+ * stopped tab suppress triggerTurn notifications in every other tab.
  */
 
 import { AgentSession } from "@earendil-works/pi-coding-agent";
 
 export type AgentAbortHandler = () => void;
 
+export interface AgentSessionHooks {
+	onAbort: AgentAbortHandler;
+	shouldSuppressTriggerTurn: () => boolean;
+}
+
 type AbortFn = (this: unknown) => Promise<void>;
 type SendCustomMessageFn = (this: unknown, message: unknown, options?: { triggerTurn?: boolean; deliverAs?: string }) => Promise<void>;
 
-let handler: AgentAbortHandler | null = null;
-/** Live AgentSession captured from the last abort call (every stop path funnels through it). */
-let liveAgentSession: unknown = null;
-/** While this predicate returns true, triggerTurn on custom messages is stripped (no autonomous run). */
-let triggerTurnGuard: (() => boolean) | null = null;
+const hooksBySessionId = new Map<string, AgentSessionHooks>();
+const liveAgentSessions = new Map<string, unknown>();
+// Backward-compatible fallback for non-session test harnesses and older hosts.
+let fallbackAbortHandler: AgentAbortHandler | null = null;
+let fallbackTriggerTurnGuard: (() => boolean) | null = null;
+let fallbackLiveAgentSession: unknown = null;
 
+function sessionIdOf(session: unknown): string | null {
+	const value = (session as { sessionId?: unknown } | null)?.sessionId;
+	return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** Register hooks for one AgentSession. The disposer only removes this exact registration. */
+export function bindAgentSessionHooks(sessionId: string, hooks: AgentSessionHooks): () => void {
+	hooksBySessionId.set(sessionId, hooks);
+	return () => {
+		if (hooksBySessionId.get(sessionId) === hooks) hooksBySessionId.delete(sessionId);
+		liveAgentSessions.delete(sessionId);
+	};
+}
+
+/** Exported for the regression check and the patched sendCustomMessage path. */
+export function shouldSuppressTriggerTurnForSession(sessionId: string): boolean {
+	return hooksBySessionId.get(sessionId)?.shouldSuppressTriggerTurn() ?? false;
+}
+
+/** Legacy single-session fallback. Prefer bindAgentSessionHooks(). */
 export function setAgentAbortHandler(fn: AgentAbortHandler | null): void {
-	handler = fn;
+	fallbackAbortHandler = fn;
 }
 
-/** Predicate consulted by the sendCustomMessage patch; index.ts wires it to the user-stop flag. */
+/** Legacy single-session fallback. Prefer bindAgentSessionHooks(). */
 export function setTriggerTurnGuard(fn: (() => boolean) | null): void {
-	triggerTurnGuard = fn;
+	fallbackTriggerTurnGuard = fn;
 }
 
-export function getLiveAgentSession(): unknown {
-	return liveAgentSession;
+export function getLiveAgentSession(sessionId?: string): unknown {
+	return sessionId ? liveAgentSessions.get(sessionId) ?? null : fallbackLiveAgentSession;
 }
 
-/** Test-only: drop the captured session so the ctx.abort() fallback is exercised. */
+/** Test-only: drop captured sessions so the ctx.abort() fallback is exercised. */
 export function resetLiveAgentSessionForTests(): void {
-	liveAgentSession = null;
+	liveAgentSessions.clear();
+	fallbackLiveAgentSession = null;
 }
 
-export function onAgentAbort(): void {
-	if (handler) {
-		try {
-			handler();
-		} catch {
-			// a broken handler must not break the abort path
-		}
+export function onAgentAbort(sessionId?: string): void {
+	const handler = sessionId ? hooksBySessionId.get(sessionId)?.onAbort : fallbackAbortHandler;
+	if (!handler) return;
+	try {
+		handler();
+	} catch {
+		// a broken handler must not break the abort path
 	}
 }
 
@@ -63,8 +83,10 @@ const origAbort = proto.abort;
 
 if (typeof origAbort === "function" && !origAbort.__piGoalAbortHook) {
 	const patched: AbortFn & { __piGoalAbortHook?: boolean } = function (this: unknown) {
-		liveAgentSession = this;
-		onAgentAbort();
+		const sessionId = sessionIdOf(this);
+		if (sessionId) liveAgentSessions.set(sessionId, this);
+		else fallbackLiveAgentSession = this;
+		onAgentAbort(sessionId ?? undefined);
 		return origAbort.call(this);
 	};
 	patched.__piGoalAbortHook = true;
@@ -72,16 +94,18 @@ if (typeof origAbort === "function" && !origAbort.__piGoalAbortHook) {
 }
 
 /**
- * While the user stop is in effect, a custom message (e.g. the bg plugin's
- * <background-task-notification> with triggerTurn:true) must still be recorded
- * in the session but must NOT start a run. Strip triggerTurn so the message
- * lands quietly and the agent stays stopped until fresh user input.
+ * While the user stop is in effect, record custom messages but do not let them
+ * wake that same session. Never consult another session's stop state.
  */
 const origSendCustomMessage = proto.sendCustomMessage;
 
 if (typeof origSendCustomMessage === "function" && !origSendCustomMessage.__piGoalTriggerGuard) {
 	const patched: SendCustomMessageFn & { __piGoalTriggerGuard?: boolean } = async function (this: unknown, message, options) {
-		if (options?.triggerTurn && triggerTurnGuard?.()) {
+		const sessionId = sessionIdOf(this);
+		const suppress = sessionId
+			? shouldSuppressTriggerTurnForSession(sessionId)
+			: fallbackTriggerTurnGuard?.() ?? false;
+		if (options?.triggerTurn && suppress) {
 			return origSendCustomMessage.call(this, message, { ...options, triggerTurn: false });
 		}
 		return origSendCustomMessage.call(this, message, options);
@@ -90,7 +114,7 @@ if (typeof origSendCustomMessage === "function" && !origSendCustomMessage.__piGo
 	proto.sendCustomMessage = patched;
 }
 
-/** No-op exported so the hook installs as a load side effect (asserted in tests). */
+/** No-op exported so the hook installs as a load side effect. */
 export function installAgentAbortHook(): void {
 	// patched at module load
 }

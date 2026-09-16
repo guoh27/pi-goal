@@ -21,7 +21,7 @@ import { RetryEngine } from "./retry/retry-engine.ts";
 import { formatDuration, resolveRetryConfig } from "./retry/retry-state.ts";
 import { parseResetWindowMs } from "./retry/error-patterns.ts";
 import { BackgroundWorkManager } from "./background/manager.ts";
-import { installAgentAbortHook, setAgentAbortHandler, setTriggerTurnGuard, getLiveAgentSession } from "./lifecycle/agent-abort-hook.ts";
+import { bindAgentSessionHooks, installAgentAbortHook, getLiveAgentSession } from "./lifecycle/agent-abort-hook.ts";
 import { installBuiltinRetryGuard, setRecoveryActivityCheck } from "./lifecycle/builtin-retry-guard.ts";
 import {
 	GoalController,
@@ -272,20 +272,10 @@ export default function piGoal(pi: ExtensionAPI) {
 	const backgroundConfig = resolveGoalControllerConfig();
 	installBuiltinRetryGuard();
 	// Every UI's stop path (TUI Esc, pi-web Stop button, RPC abort, ctx.abort())
-	// funnels into AgentSession.abort(). Hook it so a stop always reaches us —
-	// even when the agent is idle in a backoff window and no event would fire.
+	// funnels into AgentSession.abort(). The prototype hook is process-global,
+	// but registrations are session-scoped because pi-web hosts many sessions.
 	installAgentAbortHook();
-	setAgentAbortHandler(() => {
-		if (userAbortedEstablished) return;
-		userAborted = true;
-		lastStopSignalAt = Date.now();
-		controller.cancelPendingTurns();
-	});
-	// While the user stop is in effect, strip triggerTurn from custom messages
-	// (the bg plugin's background-task-notification with triggerOnCompletion)
-	// so no autonomous run can start from them. The message still lands in the
-	// session; only the wake is suppressed.
-	setTriggerTurnGuard(() => userAborted);
+	let sessionHooksDisposer: (() => void) | null = null;
 	// While the merged engine owns recovery (pending action or driving phase),
 	// pi's builtin retry must step aside to avoid double-engine retry storms.
 	setRecoveryActivityCheck(
@@ -801,6 +791,16 @@ export default function piGoal(pi: ExtensionAPI) {
 
 		pi.on("session_start", (event, ctx) => {
 			captureCtx(ctx);
+			sessionHooksDisposer?.();
+			sessionHooksDisposer = bindAgentSessionHooks(ctx.sessionManager.getSessionId(), {
+				onAbort: () => {
+					if (userAbortedEstablished) return;
+					userAborted = true;
+					lastStopSignalAt = Date.now();
+					controller.cancelPendingTurns();
+				},
+				shouldSuppressTriggerTurn: () => userAborted,
+			});
 			registerEscapeInterrupt(ctx);
 			const restored = latestStateFromSession(ctx);
 			goal = restored.goal;
@@ -835,6 +835,8 @@ export default function piGoal(pi: ExtensionAPI) {
 
 		pi.on("session_shutdown", (event, ctx) => {
 			captureCtx(ctx);
+			sessionHooksDisposer?.();
+			sessionHooksDisposer = null;
 			terminalInputDisposer?.();
 			terminalInputDisposer = null;
 			// Retire tasks still running at a session boundary so an old session's
@@ -856,7 +858,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			// TUI mode (it only restores queued editor text), so prefer the live
 			// AgentSession captured by the abort hook.
 			if (userAborted) {
-				const session = getLiveAgentSession();
+				const session = getLiveAgentSession(ctx.sessionManager.getSessionId());
 				try {
 					if (session) {
 						void AgentSession.prototype.abort.call(session);

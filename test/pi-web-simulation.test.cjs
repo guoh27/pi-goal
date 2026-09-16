@@ -47,7 +47,14 @@ test("pi-web topology: AgentSession.abort() reaches the extension and cancels re
 	await harness.simulateRun(fake, { role: "assistant", stopReason: "error", errorMessage: "503 status code", content: [] });
 
 	// 4. pi-web Stop button while idle in the backoff window.
-	const fakeSession = { abortRetry() {}, agent: { abort() {} }, async waitForIdle() {} };
+	const fakeSession = {
+		sessionId: fake.state.sessionId,
+		abortRetry() {},
+		abortCompaction() {},
+		abortBranchSummary() {},
+		agent: { abort() {} },
+		async waitForIdle() {},
+	};
 	await AgentSession.prototype.abort.call(fakeSession);
 
 	// 5. the pending retry must be cancelled.

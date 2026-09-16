@@ -194,6 +194,29 @@ test("manager aggregates multiple providers and reports unknown fail-closed", as
 	}
 });
 
+test("multiple pi-web sessions keep their built-in background adapters isolated", async () => {
+	const busA = makeBus();
+	const busB = makeBus();
+	respondBg(busA, "task-a");
+	const managerA = new BackgroundWorkManager(busA, { queryTimeoutMs: 50 });
+	respondBg(busB, "task-b");
+	const managerB = new BackgroundWorkManager(busB, { queryTimeoutMs: 50 });
+	await flush();
+
+	assert.deepEqual((await managerA.snapshot("session-a")).activeIds, ["task-a"]);
+	assert.deepEqual((await managerB.snapshot("session-b")).activeIds, ["task-b"]);
+
+	function respondBg(bus, id) {
+		bus.on(BG_REQUEST_CHANNEL, (request) => {
+			bus.emit(BG_RESPONSE_CHANNEL, {
+				request_id: request.request_id,
+				ok: true,
+				result: request.operation === "status" ? { tasks: [{ id, status: "running" }] } : {},
+			});
+		});
+	}
+});
+
 test("manager.subscribeAll wires change signals from built-in adapters", async () => {
 	const bus = makeBus();
 	const manager = new BackgroundWorkManager(bus, { queryTimeoutMs: 50 });

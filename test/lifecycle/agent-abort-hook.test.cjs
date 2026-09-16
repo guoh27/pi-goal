@@ -31,6 +31,24 @@ test("AgentSession.abort is wrapped and fires the registered handler", async () 
 	hook.setAgentAbortHandler(null);
 });
 
+test("session guards are isolated in a multi-session host such as pi-web", async () => {
+	const hook = await jiti.import("../../src/lifecycle/agent-abort-hook.ts");
+	const releaseA = hook.bindAgentSessionHooks("session-a", {
+		onAbort() {},
+		shouldSuppressTriggerTurn: () => false,
+	});
+	const releaseB = hook.bindAgentSessionHooks("session-b", {
+		onAbort() {},
+		shouldSuppressTriggerTurn: () => true,
+	});
+
+	assert.equal(hook.shouldSuppressTriggerTurnForSession("session-a"), false);
+	assert.equal(hook.shouldSuppressTriggerTurnForSession("session-b"), true);
+
+	releaseA();
+	releaseB();
+});
+
 test("abort hook fires during an active run too", async () => {
 	const { AgentSession } = await jiti.import("../../../node_modules/@earendil-works/pi-coding-agent/dist/index.js");
 	const hook = await jiti.import("../../src/lifecycle/agent-abort-hook.ts");

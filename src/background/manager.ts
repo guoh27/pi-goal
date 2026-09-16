@@ -3,8 +3,9 @@
  * third-party providers registered in the open registry
  * (`Symbol.for("pi-goal.background-work.v1")`).
  *
- * Built-in adapters are themselves registered into the same registry, so the
- * goal layer has exactly one way to ask "is any background work outstanding?".
+ * Built-in adapters stay session-local because pi-web hosts multiple sessions
+ * with distinct EventBus instances in one process. The open registry is only
+ * for third-party providers.
  *
  * Fail-closed: a provider query that times out or returns malformed data
  * yields state "unknown", which the goal layer treats like active work.
@@ -13,7 +14,6 @@
 import { PiBackgroundTasksAdapter } from "./pi-background-tasks-adapter.ts";
 import { PiSubagentsAdapter } from "./pi-subagents-adapter.ts";
 import {
-	ensureBackgroundWorkRegistry,
 	listBackgroundWorkProviders,
 	snapshotAllProviders,
 	type BackgroundWorkProvider,
@@ -44,10 +44,6 @@ export class BackgroundWorkManager {
 	constructor(events: EventBusLike, options?: { queryTimeoutMs?: number; probeRetryDelayMs?: number }) {
 		this.bgTasks = new PiBackgroundTasksAdapter(events, options);
 		this.subagents = new PiSubagentsAdapter(events, options);
-		// Register built-ins into the open registry so third parties can see them too.
-		const registry = ensureBackgroundWorkRegistry();
-		registry.providers.set(this.bgTasks.name, this.bgTasks);
-		registry.providers.set(this.subagents.name, this.subagents);
 	}
 
 	/**
@@ -77,13 +73,18 @@ export class BackgroundWorkManager {
 	}
 
 	private currentProviders(): BackgroundWorkProvider[] {
-		return listBackgroundWorkProviders().filter((provider) => {
-			if (provider instanceof PiBackgroundTasksAdapter || provider instanceof PiSubagentsAdapter) {
-				// Built-ins degrade gracefully when their plugin is not installed.
-				return provider.getAvailable();
-			}
-			return true; // third-party providers are trusted present
-		});
+		// Built-ins are session-bound because each pi-web session has its own
+		// EventBus. Never take another session's adapters from the process-global
+		// third-party registry.
+		const builtins = [this.bgTasks, this.subagents].filter((provider) => provider.getAvailable());
+		const builtinNames = new Set<string>(builtins.map((provider) => provider.name));
+		const thirdParty = listBackgroundWorkProviders().filter(
+			(provider) =>
+				!(provider instanceof PiBackgroundTasksAdapter) &&
+				!(provider instanceof PiSubagentsAdapter) &&
+				!builtinNames.has(provider.name),
+		);
+		return [...builtins, ...thirdParty];
 	}
 
 	async snapshot(sessionId: string): Promise<AggregatedSnapshot> {

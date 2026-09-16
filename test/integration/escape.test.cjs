@@ -153,7 +153,10 @@ test("session.abort() from any UI (pi-web stop) cancels a pending retry", async 
 
 	// pi-web Stop button with agent idle in the backoff window.
 	const fakeSession = {
+		sessionId: h.state.sessionId,
 		abortRetry() {},
+		abortCompaction() {},
+		abortBranchSummary() {},
 		agent: { abort() {} },
 		async waitForIdle() {},
 	};
@@ -181,6 +184,7 @@ test("background-task-notification triggerTurn is suppressed while the stop is i
 	const h = await setup();
 	let runStarted = 0;
 	const fakeSession = {
+		sessionId: h.state.sessionId,
 		isStreaming: false,
 		agent: { state: { messages: [] } },
 		sessionManager: { appendCustomMessageEntry() {} },
